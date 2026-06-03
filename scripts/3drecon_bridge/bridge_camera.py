@@ -537,20 +537,19 @@ class BridgeCamera(Camera):
             apply_optical_correction=self.cfg.apply_optical_frame_correction,
         )
 
-        t_cam_anchor = t_cam_simworld
-
         # Rebase: anchor frame = camera's optical frame at t=0, so
-        # T_cam_anchor(t) = T_cam_simworld(t) @ inv(T_cam_simworld(0)).
-        if self.cfg.rebase_to_initial_pose:
-            if self._initial_world_T_cam is None:
-                self._initial_world_T_cam = np.linalg.inv(t_cam_simworld).astype(
-                    np.float64, copy=False
-                )
-                t_cam_anchor = np.eye(4, dtype=np.float32)
-            else:
-                t_cam_anchor = (
-                    t_cam_simworld.astype(np.float64) @ self._initial_world_T_cam
-                ).astype(np.float32)
+        # T_cam_anchor(t) = T_cam_simworld(t) @ inv(T_cam_simworld(0)). The
+        # first pose sent is therefore identity and later poses describe motion
+        # relative to the initial location.
+        if self._initial_world_T_cam is None:
+            self._initial_world_T_cam = np.linalg.inv(t_cam_simworld).astype(
+                np.float64, copy=False
+            )
+            t_cam_anchor = np.eye(4, dtype=np.float32)
+        else:
+            t_cam_anchor = (
+                t_cam_simworld.astype(np.float64) @ self._initial_world_T_cam
+            ).astype(np.float32)
 
         # Axis remap: flip X and Z of the anchor frame so it has
         # +X = left, +Y = down (unchanged), +Z = back.

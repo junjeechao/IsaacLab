@@ -50,14 +50,6 @@ class BridgeCameraCfg(CameraCfg):
     publish_every_n_steps: int = 1
     """Throttle: publish every N camera updates."""
 
-    rebase_to_initial_pose: bool = False
-    """Anchor the published ``T_cam_world`` to the first frame.
-
-    When ``True``, the first ``T_cam_world`` is captured and every subsequent
-    one is post-multiplied by its inverse, so the first pose sent is the
-    identity and later poses describe motion relative to the initial location.
-    """
-
     debug_window: bool = True
     """Open a side-by-side cv2 preview window showing the exact bytes shipped.
 
