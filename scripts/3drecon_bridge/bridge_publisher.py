@@ -32,6 +32,16 @@ _MAGIC = b"ILRGBD1\0"
 _SCHEMA_VERSION = 1
 _DEPTH_SCALE_M_PER_UNIT = 0.001  # depth on the wire is uint16 millimeters
 
+# Stereo host-staged variant (wire v3): identical header fields plus a trailing
+# ``baseline_m`` float32 (header_size = 144), shipped as a FOUR-part multipart:
+# header, rgb_left, rgb_right, depth. Consumers dispatch on the magic.
+_HEADER_FORMAT_V3 = "<8sIIQqII5f16fQIIf"
+_HEADER_SIZE_V3 = struct.calcsize(_HEADER_FORMAT_V3)
+assert _HEADER_SIZE_V3 == 144, f"Expected 144-byte v3 header, got {_HEADER_SIZE_V3}"
+
+_MAGIC_V3 = b"ILRGBD3\0"
+_SCHEMA_VERSION_V3 = 3
+
 
 class BridgePublisher:
     """ZeroMQ ``PUSH`` publisher that ships RGB-D frames to the Holoscan receiver.
@@ -82,7 +92,7 @@ class BridgePublisher:
             finally:
                 self._socket = None
 
-    def __enter__(self) -> "BridgePublisher":
+    def __enter__(self) -> BridgePublisher:
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
@@ -109,8 +119,10 @@ class BridgePublisher:
         cy: float,
         t_cam_world_column_major: np.ndarray,
         timestamp_ns: int | None = None,
+        rgb_right_bytes: bytes | None = None,
+        baseline_m: float = 0.0,
     ) -> None:
-        """Pack and send a single RGB-D frame.
+        """Pack and send a single RGB-D frame (optionally with a right RGB eye).
 
         Args:
             rgb_bytes: Contiguous ``height * width * 3`` uint8 RGB payload.
@@ -128,6 +140,10 @@ class BridgePublisher:
                 Eigen ``ColMajor`` ``Map`` used in ``NvbloxOp``).
             timestamp_ns: Optional capture timestamp [ns]. If ``None``,
                 ``time.monotonic_ns()`` is used.
+            rgb_right_bytes: Optional right-eye RGB payload (same size as
+                ``rgb_bytes``). When given, the message is sent in the stereo
+                v3 wire format (144-byte header + 4 parts) instead of v1.
+            baseline_m: Stereo baseline [m] (v3 header field; ignored for v1).
         """
         if self._socket is None:
             raise RuntimeError("BridgePublisher socket is already closed")
@@ -135,25 +151,20 @@ class BridgePublisher:
         expected_rgb = width * height * 3
         expected_depth = width * height * 2
         if len(rgb_bytes) != expected_rgb:
-            raise ValueError(
-                f"rgb_bytes size mismatch: got {len(rgb_bytes)}, expected {expected_rgb}"
-            )
+            raise ValueError(f"rgb_bytes size mismatch: got {len(rgb_bytes)}, expected {expected_rgb}")
         if len(depth_u16_mm_bytes) != expected_depth:
             raise ValueError(
-                f"depth_u16_mm_bytes size mismatch: got {len(depth_u16_mm_bytes)},"
-                f" expected {expected_depth}"
+                f"depth_u16_mm_bytes size mismatch: got {len(depth_u16_mm_bytes)}, expected {expected_depth}"
             )
+        if rgb_right_bytes is not None and len(rgb_right_bytes) != expected_rgb:
+            raise ValueError(f"rgb_right_bytes size mismatch: got {len(rgb_right_bytes)}, expected {expected_rgb}")
         if t_cam_world_column_major.size != 16:
             raise ValueError("t_cam_world_column_major must contain 16 floats")
 
         ts_ns = int(time.monotonic_ns()) if timestamp_ns is None else int(timestamp_ns)
         pose = np.ascontiguousarray(t_cam_world_column_major, dtype=np.float32).ravel()
 
-        header = struct.pack(
-            _HEADER_FORMAT,
-            _MAGIC,
-            _SCHEMA_VERSION,
-            _HEADER_SIZE,
+        common_fields = (
             self._frame_id,
             ts_ns,
             int(width),
@@ -168,6 +179,23 @@ class BridgePublisher:
             expected_rgb,
             expected_depth,
         )
+        if rgb_right_bytes is not None:
+            header = struct.pack(
+                _HEADER_FORMAT_V3,
+                _MAGIC_V3,
+                _SCHEMA_VERSION_V3,
+                _HEADER_SIZE_V3,
+                *common_fields,
+                float(baseline_m),
+            )
+        else:
+            header = struct.pack(
+                _HEADER_FORMAT,
+                _MAGIC,
+                _SCHEMA_VERSION,
+                _HEADER_SIZE,
+                *common_fields,
+            )
 
         # PUSH with HWM=1 will drop newest if the receiver is behind, so the
         # Holoscan side always sees the freshest frame.
@@ -175,6 +203,8 @@ class BridgePublisher:
         try:
             self._socket.send(header, flags=flags | self._zmq.SNDMORE)
             self._socket.send(rgb_bytes, flags=flags | self._zmq.SNDMORE)
+            if rgb_right_bytes is not None:
+                self._socket.send(rgb_right_bytes, flags=flags | self._zmq.SNDMORE)
             self._socket.send(depth_u16_mm_bytes, flags=flags)
         except self._zmq.Again:
             # Receiver isn't keeping up; drop this frame entirely so we don't

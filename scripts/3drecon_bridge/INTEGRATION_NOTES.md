@@ -1,5 +1,34 @@
 # Isaac Lab ↔ realtime-3d-reconstruction Bridge — Integration Notes
 
+## Stable interactive defaults (2026-09-08)
+
+Run `./isaaclab.sh -p scripts/3drecon_bridge/run_g1_bridge_teleop.py`.
+The runner enables cameras automatically, starts level, disables training
+episode resets, and holds the robot until X+Y+A+B toggles engagement.
+Look forward with the controllers in the robot's initial L-shaped arm pose
+when engaging. Full SE(3) wrist clutching and a forward-view head rotation
+reference prevent an initial pose snap. Left squeeze + A reclutches the hands.
+
+The default world-parented gimbal follows the torso mount in translation
+with a 0.25 s low-pass. While engaged, headset rotation relative to the engage
+reference controls the view; headset translation never drives the camera.
+Disengagement smoothly returns to the leveled torso heading. Head tracking
+loss freezes the last camera orientation; fresh input is required to update
+it. Controller loss captures a current hold once and reclutches on recovery.
+`--no_xr_head_camera` also applies to the gimbal path.
+
+Publication starts after mount initialization. The stereo host multipart
+transport remains the default (the optional IPC ring has no consumer ack).
+Left RGB/depth and right RGB must share a physics capture step; mismatched
+pairs are dropped. Both rendered camera poses are checked against the
+advertised rectified baseline. The published pose uses the left camera's
+captured Fabric pose; missing exact poses drop the frame instead of falling
+back to a potentially stale framework pose. The map is still rebased to the
+first published optical camera frame with the existing X/Z axis remap.
+
+The historical sections below describe earlier defaults and experiments;
+this section supersedes their position-only clutch and pitched-camera defaults.
+
 This document records the end-to-end design we converged on for hooking Isaac
 Lab's G1 locomanipulation env into the `realtime-3d-reconstruction` Holoscan
 app, including how two OpenXR/CloudXR clients coexist on one host. It is
@@ -173,6 +202,112 @@ The header is exactly 140 bytes and mirrors `IsaacLabRgbdHeader` from
 
 The receiver rejects mismatched magic, schema, header size, or payload sizes
 and skips the frame.
+
+### Stereo variants (v3 host-staged, v4 CUDA-IPC)
+
+When the scene declares a `stereo_role="right"` render-only camera (see
+`locomanipulation_g1_bridge_env_cfg.py`), the publishing `"left"` camera ships
+its RGB alongside so a consumer (e.g. the televiz `isaac_sim` source) gets a
+time-aligned stereo pair + GT depth + GT pose:
+
+* **v3 (host path, `use_cuda_ipc=False`)** — magic `"ILRGBD3\0"`, schema 3,
+  header = the 140-byte v1 layout plus a trailing `baseline_m` float32
+  (`header_size=144`, format `<8sIIQqII5f16fQIIf`), FOUR-part multipart:
+  `header, rgb_left, rgb_right, depth`.
+* **v4 (CUDA-IPC)** — magic `"ILRGBD4\0"`, schema 4. Handshake gains a
+  trailing `baseline_m` float32 (40 bytes, `<8sIIIIIIIf`) and each ring slot
+  carries THREE 64-byte mem handles (`rgb_left + rgb_right + depth`,
+  192 bytes/slot). Per-frame header layout identical to v2 apart from
+  magic/schema.
+
+Mono scenes keep emitting v1/v2 byte-for-byte, so the existing Holoscan
+receiver is unaffected. The right camera never publishes; it registers itself
+(`bridge_camera._STEREO_REGISTRY`) and must be declared BEFORE the left camera
+in the scene cfg so it renders first each step (the left camera verifies this
+via a render-step counter and degrades to mono with a warning if violated).
+
+### Stabilized camera mount (default; `--camera_stabilize_s`, 0 = rigid)
+
+The Agile balance policy micro-sways the torso ~0.2 deg / ~0.6 mm EVERY step
+(measured with `--pose_diag`; the mount-point lever arm makes it ~2.4 mm at
+the camera). A torso-parented camera inherits that rigidly — ~3 px/frame of
+image jitter at 1280 px. Two findings drove the fix:
+
+1. A plain low-pass on the camera pose barely helps: the sway is a ~1 Hz
+   oscillation, not per-frame noise, so tau=0.25 s attenuated rotation only
+   0.21 -> 0.19 deg/step. Cranking tau would lag the camera when the robot
+   walks.
+2. What shakes the IMAGE is rotation; ~2 mm positional jitter is sub-pixel
+   at scene distance.
+
+So `_StabilizedCameraDriver` does what a real gimbal does: the cameras are
+parented to the WORLD (no scene-graph coupling to the sway) and driven every
+step to the torso mount point with the position low-passed (tau) and the
+orientation LEVELED — roll/pitch dropped outright, only the torso yaw is
+followed (smoothed), composed with the cfg mount rotation. Measured result:
+0.21 -> **0.001 deg/step** (~200x); position ~1.9 mm/step residual
+(sub-pixel). The XR head rotation, when engaged, passes through UNFILTERED
+(it is a command, not sway). GT pose stays exact (leaf-prim readback), and a
+warm-up drive before the first render keeps the pose-rebase anchor off the
+world-parented spawn pose. `--keyboard`/`--demo` disable stabilization (they
+own the camera and assume the torso-parented mount).
+
+### XR-head-driven virtual camera
+
+By default the runner drives the camera pair as a rotation-only virtual head
+(`_XrHeadCameraController`; disable with `--no_xr_head_camera`): translation
+stays rigidly bound to the torso through the plain scene-graph parenting
+(the controller sets orientation-only via `positions=None` and does NOTHING
+until the first valid head pose — re-setting the full pose per step from a
+one-render-stale parent read double-differences the balance micro-motion
+and visibly jitters the image), while rotation follows the raw XR headset
+orientation. The raw head pose is not
+exposed by the upstream pipeline (the anchor synchronizer's yaw comes from the
+pelvis prim, not the headset), so `_build_pipeline_with_head()` wraps the
+upstream pipeline with an isaacteleop `HeadSource` transformed by the same
+`world_T_anchor` matrix (fed through its own external-input leaf
+`world_T_anchor_head`), adding a `"head"` output to `session.step()`. The
+OpenXR view-frame orientation (-Z forward, +Y up) is converted to the
+world/ROS body convention via `_R_USDCAM_TO_BODY` before `set_world_poses`.
+The published `T_cam_world` (GT pose) needs no extra plumbing: it is read back
+from the moved leaf camera prim's Fabric matrix after each render, so it
+always matches the XR-driven render pose.
+
+### Teleop engage gate (default on; `--no_engage_gate` reverts)
+
+The bare pipeline had three hazards: (1) no engagement — the robot followed
+the controllers the moment the XR session connected (the official
+`IsaacTeleopDevice` path gates via `DefaultTeleopStateManager` + buttons,
+which our standalone session bypassed); (2) `Se3AbsRetargeter` is absolute
+with no clutch, so the wrist target jumped by your-hand-vs-robot-hand
+displacement at first tracked frame — and emitted its last pose
+(initialized at the WORLD ORIGIN) whenever a controller was untracked,
+yanking the arms toward the pelvis; (3) the locomotion retargeter has no
+thumbstick deadzone and integrates hip height even while idle.
+
+`_TeleopEngageGate` (runner) fixes all three. A parallel `ControllersSource`
+("bridge_buttons") is exposed through the pipeline's OutputCombiner (the
+`SessionLifecycle._button_controllers` idiom); the gate reads button edges +
+grip validity from it and wraps every action:
+
+* The engage chord **X+Y+A+B** (all four face buttons together;
+  `--engage_chord`) toggles ENGAGED ↔ HELD; while held the robot gets a
+  hold-pose action re-captured at its CURRENT configuration. A chord
+  already held at connect never reads as a press (fail-safe edge init,
+  like `DefaultTeleopStateManager`).
+* On every engage / reset / tracking recovery, the gate captures
+  `robot_wrist − target` and composes it onto all subsequent targets
+  (`--engage_clutch pos` default: positions only; `full`: SE(3); `off`),
+  so the first commanded pose IS the robot's current hand pose — no jump.
+* Either controller untracked (grip invalid / group none) → auto-hold and
+  re-clutch on recovery; engage presses are refused while untracked.
+* The reset chord **left squeeze + right A** (`--reset_chord`): engaged →
+  re-clutch + hip reset; held → re-capture the hold pose. Chord token
+  syntax: x/y/a/b face buttons, [lr]squeeze, [lr]trigger, [lr]menu,
+  [lr]stick. Overlapping chords resolve engage-first.
+* Locomotion is recomputed from raw thumbsticks with `--stick_deadzone`
+  (rescaled above it) using the stock retargeter's exact mapping/constants,
+  and the gate owns hip-height integration (only while engaged).
 
 ## 6. Pose conventions (the easy thing to get wrong)
 
@@ -412,6 +547,22 @@ fall-back combination for verifying the bridge without involving CloudXR.
 Gotchas we tripped over during bring-up, captured here so future-you (or
 future-someone-else) doesn't.
 
+### `body_quat_w` is xyzw on this branch — never swizzle it
+
+This Isaac Lab branch changed the quaternion convention REPO-WIDE from wxyz
+to xyzw (commit `9659a5ce`): `body_quat_w`, `matrix_from_quat`, and the Pink
+IK action's quat slices are all `(x, y, z, w)`. The hold-pose builder
+originally applied a wxyz→xyzw swizzle to `body_quat_w` — a cyclic
+permutation of an already-xyzw quat is a large, orientation-dependent bogus
+rotation, so both wrist targets were commanded heavily twisted (arms cranked
+to one side, IK fighting the waist tasks, whole robot shaking) whenever the
+hold action was applied. Related trap in the same function: the locomotion
+slice's hip height is an ABSOLUTE command (clamped 0.4–1.0 downstream) —
+zeroing it orders a full crouch. Hold actions must carry hip 0.72. Also note
+the Pink IK action expects positions in the ENV-ORIGIN frame (it subtracts
+`env_origins` from the base pose only), so `body_pos_w` needs the env origin
+subtracted (a no-op at num_envs=1).
+
 ### G1 has no `head_link` body in the articulation
 
 The Unitree G1 URDF/USD does **not** include a `head_link` as part of the
@@ -450,7 +601,7 @@ actually a child of the body you expected.**
 
 Inherited from upstream `CameraCfg`. With the default, the camera's world
 transform is captured **once, at scene initialization**, and the renderer
-re-uses that cached value forever. The camera prim's position never tracks
+reuses that cached value forever. The camera prim's position never tracks
 its parent's motion. For a camera mounted on an articulation body that
 should follow the body's motion, this flag must be set to `True`. The cost
 is a per-step `FrameView` traversal — negligible at one camera, but the

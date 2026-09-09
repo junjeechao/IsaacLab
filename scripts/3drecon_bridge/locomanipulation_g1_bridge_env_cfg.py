@@ -7,6 +7,8 @@
 
 from __future__ import annotations
 
+from bridge_camera_cfg import BridgeCameraCfg
+
 import isaaclab.sim as sim_utils
 from isaaclab.utils.configclass import configclass
 
@@ -15,12 +17,38 @@ from isaaclab_tasks.manager_based.locomanipulation.pick_place.locomanipulation_g
     LocomanipulationG1SceneCfg,
 )
 
-from bridge_camera_cfg import BridgeCameraCfg
-
 
 @configclass
 class LocomanipulationG1BridgeSceneCfg(LocomanipulationG1SceneCfg):
     """Scene config that adds a bridge camera mounted on the G1's torso."""
+
+    # Right eye of the stereo pair: RGB-only, render-only (never publishes;
+    # the left camera pulls its RGB at publish time -- see
+    # BridgeCameraCfg.stereo_role). Declared BEFORE ``bridge_camera`` so it
+    # updates/renders first each step and the stereo pair is time-aligned.
+    # Offset matches the left eye shifted by -stereo_baseline_m along the
+    # torso's +Y (left) axis: right eye = -Y.
+    bridge_camera_right: BridgeCameraCfg = BridgeCameraCfg(
+        prim_path="/World/envs/env_.*/Robot/torso_link/bridge_camera_right",
+        update_period=0.0,
+        update_latest_camera_pose=True,
+        height=720,
+        width=1280,
+        data_types=["rgb"],
+        spawn=sim_utils.PinholeCameraCfg(
+            focal_length=18.0,
+            focus_distance=400.0,
+            horizontal_aperture=36.0,
+            clipping_range=(0.05, 20.0),
+        ),
+        offset=BridgeCameraCfg.OffsetCfg(
+            pos=(0.10, -0.063, 0.50),
+            rot=(0.0, 0.0, 0.0, 1.0),
+            convention="world",
+        ),
+        stereo_role="right",
+        debug_window=False,
+    )
 
     # G1 has no ``head_link`` body; the head is a static visual under
     # ``torso_link``. Parent here and apply a +Z offset to reach head height.
@@ -48,6 +76,8 @@ class LocomanipulationG1BridgeSceneCfg(LocomanipulationG1SceneCfg):
             convention="world",
         ),
         endpoint="tcp://127.0.0.1:5570",
+        stereo_role="left",
+        stereo_baseline_m=0.063,
     )
 
 

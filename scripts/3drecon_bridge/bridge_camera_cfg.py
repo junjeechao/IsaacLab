@@ -38,9 +38,54 @@ class BridgeCameraCfg(CameraCfg):
     publish_view_index: int = 0
     """Which view to publish when the cfg vectorises. Only one view is supported."""
 
+    publish_enabled: bool = True
+    """Publish captures only after the runner has initialized the camera mount."""
+
+    stereo_role: str = "mono"
+    """Role of this camera in an optional stereo pair: ``"mono"``, ``"left"`` or ``"right"``.
+
+    * ``"mono"`` (default): publish RGB-D exactly as before (wire v1/v2).
+    * ``"left"``: this camera publishes. If a ``"right"`` camera is present in
+      the scene, its RGB is shipped alongside as a stereo pair (wire v3/v4);
+      otherwise behaves like ``"mono"``.
+    * ``"right"``: render-only. Never publishes; registers itself so the
+      ``"left"`` camera can pull its RGB at publish time. Only needs
+      ``data_types=["rgb"]`` (no depth). Declare the right camera *before* the
+      left one in the scene cfg so it renders first each step and the pair is
+      time-aligned.
+    """
+
+    stereo_baseline_m: float = 0.063
+    """Stereo baseline [m] between the left and right eyes (left cfg only).
+
+    Shipped to the receiver in the stereo handshake/header and used by the
+    runner to place the right eye at ``-baseline`` along the left camera's
+    body +Y (left) axis when a controller drives the pair. Must match the
+    lateral separation of the two cameras' ``offset.pos`` in the scene cfg.
+    """
+
     max_depth_m: float = 65.0
     """Clamp on the wire. Values > this (and non-finite) become 0 (invalid).
     The uint16 mm wire format caps at 65.535 m anyway."""
+
+    edge_mask_enabled: bool = False
+    """Zero out depth pixels on/near depth discontinuities before publishing.
+
+    At a foreground/background silhouette, depth and color don't correspond
+    cleanly (mixed/flying depth pixels; anti-aliased or blurred color edges;
+    depth<->color misregistration on real cameras). Pairing them bleeds
+    foreground color onto background geometry downstream (nvblox color layer,
+    projective texturing, colored point clouds). Dropping these edge pixels at
+    the source removes the bleed for every consumer. Invalid (0) depth makes the
+    receiver skip the pixel entirely, so masking depth also drops its color."""
+
+    edge_mask_depth_threshold_m: float = 0.05
+    """A 4-neighbour depth jump larger than this (meters) marks a discontinuity.
+    Lower to cull shallower steps; raise to keep them."""
+
+    edge_mask_dilate_px: int = 1
+    """Dilate the discontinuity mask by this many pixels (0 = edge pixels only).
+    Raise to 2-3 if a thin fringe remains (wider contaminated band)."""
 
     apply_optical_frame_correction: bool = True
     """Rotate the world pose into OpenCV optical convention (``+Z`` through

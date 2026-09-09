@@ -36,6 +36,14 @@ Handshake (single ZMQ message, sent once before the first frame)
     rgb_mem_handle    64 B  (cudaIpcMemHandle_t)
     depth_mem_handle  64 B  (cudaIpcMemHandle_t)
 
+Wire format v4 (stereo)
+=======================
+
+Same as v2 with magic ``"ILRGBD4\\0"`` / schema 4, except: the handshake
+header gains a trailing float32 ``baseline_m`` (40 bytes total) and each
+ring-slot handle group is ``rgb_left + rgb_right + depth`` (192 bytes/slot).
+The per-frame header layout is identical to v2 apart from magic/schema.
+
 Per-frame (single ZMQ message, header only)
 -------------------------------------------
 ``<8sIIIQqII5f16fQII`` (144 bytes)::
@@ -85,6 +93,17 @@ _V2_FRAME_SIZE = struct.calcsize(_V2_FRAME_FORMAT)  # 144
 
 _MAGIC_V2 = b"ILRGBD2\0"
 _SCHEMA_VERSION_V2 = 2
+
+# Stereo CUDA-IPC variant (wire v4). Handshake gains a trailing float32
+# ``baseline_m`` (40 bytes) and each ring-slot handle triple is
+# ``rgb_left + rgb_right + depth`` (192 bytes/slot). The per-frame header
+# layout is identical to v2 apart from magic/schema.
+_V4_HANDSHAKE_FORMAT = "<8sIIIIIIIf"
+_V4_HANDSHAKE_SIZE = struct.calcsize(_V4_HANDSHAKE_FORMAT)  # 40
+
+_MAGIC_V4 = b"ILRGBD4\0"
+_SCHEMA_VERSION_V4 = 4
+
 _MESSAGE_TYPE_HANDSHAKE = 0
 _MESSAGE_TYPE_FRAME = 1
 _DEPTH_DTYPE_UINT16_MM = 0
@@ -99,8 +118,7 @@ def _load_cudart():
         from cuda.bindings import runtime as cudart  # cuda-python >= 12
     except ImportError as e:
         raise RuntimeError(
-            "BridgePublisherIPC requires cuda-python. Install with:\n"
-            "    ./isaaclab.sh -p -m pip install cuda-python"
+            "BridgePublisherIPC requires cuda-python. Install with:\n    ./isaaclab.sh -p -m pip install cuda-python"
         ) from e
     return cudart
 
@@ -124,9 +142,7 @@ def _handle_bytes(handle) -> bytes:
     """Extract the 64-byte ``reserved`` field of a cudaIpc{Mem,Event}Handle_t."""
     raw = bytes(handle.reserved)
     if len(raw) != _IPC_HANDLE_SIZE:
-        raise RuntimeError(
-            f"Expected {_IPC_HANDLE_SIZE}-byte IPC handle, got {len(raw)}"
-        )
+        raise RuntimeError(f"Expected {_IPC_HANDLE_SIZE}-byte IPC handle, got {len(raw)}")
     return raw
 
 
@@ -147,6 +163,8 @@ class BridgePublisherIPC:
         height: int,
         ring_size: int = 3,
         device: str | torch.device = "cuda:0",
+        stereo: bool = False,
+        baseline_m: float = 0.0,
     ) -> None:
         try:
             import zmq
@@ -159,6 +177,8 @@ class BridgePublisherIPC:
         self._height = int(height)
         self._ring_size = int(ring_size)
         self._device = torch.device(device)
+        self._stereo = bool(stereo)
+        self._baseline_m = float(baseline_m)
         self._frame_id = 0
         self._reset_sequence = 0
         self._slot = 0
@@ -187,6 +207,7 @@ class BridgePublisherIPC:
         # the base block, so the consumer reads stale memory.
         with torch.cuda.device(self._device):
             self._rgb_slot_ptrs: list[int] = []
+            self._rgb_right_slot_ptrs: list[int] = []
             self._depth_slot_ptrs: list[int] = []
             stream_ptr = torch.cuda.current_stream(self._device).cuda_stream
             for _ in range(self._ring_size):
@@ -199,6 +220,16 @@ class BridgePublisherIPC:
                     "cudaMemsetAsync(rgb slot)",
                 )
 
+                if self._stereo:
+                    err, p_rgb_r = cudart.cudaMalloc(self._rgb_slot_bytes)
+                    _check(cudart, err, "cudaMalloc(rgb right slot)")
+                    self._rgb_right_slot_ptrs.append(int(p_rgb_r))
+                    _check(
+                        cudart,
+                        cudart.cudaMemsetAsync(int(p_rgb_r), 0, self._rgb_slot_bytes, stream_ptr),
+                        "cudaMemsetAsync(rgb right slot)",
+                    )
+
                 err, p_depth = cudart.cudaMalloc(self._depth_slot_bytes)
                 _check(cudart, err, "cudaMalloc(depth slot)")
                 self._depth_slot_ptrs.append(int(p_depth))
@@ -209,28 +240,30 @@ class BridgePublisherIPC:
                 )
             torch.cuda.synchronize(self._device)
 
-            self._rgb_mem_handles = [
-                self._get_mem_handle_from_ptr(p) for p in self._rgb_slot_ptrs
-            ]
-            self._depth_mem_handles = [
-                self._get_mem_handle_from_ptr(p) for p in self._depth_slot_ptrs
-            ]
+            self._rgb_mem_handles = [self._get_mem_handle_from_ptr(p) for p in self._rgb_slot_ptrs]
+            self._rgb_right_mem_handles = [self._get_mem_handle_from_ptr(p) for p in self._rgb_right_slot_ptrs]
+            self._depth_mem_handles = [self._get_mem_handle_from_ptr(p) for p in self._depth_slot_ptrs]
 
         # Diagnostic so a GPU-index mismatch with the container is obvious.
         gpu_name = torch.cuda.get_device_name(self._device)
         gpu_uuid = ""
         try:
             from cuda.bindings import runtime as _rt
+
             err, props = _rt.cudaGetDeviceProperties(self._device.index)
             if err == _rt.cudaError_t.cudaSuccess:
                 gpu_uuid = bytes(props.uuid.bytes).hex()
         except Exception:  # pragma: no cover - best-effort
             pass
         logger.info(
-            "BridgePublisherIPC initialized: %dx%d, ring_size=%d, endpoint=%s,"
-            " device=%s (%s, uuid=%s)",
-            self._width, self._height, self._ring_size, endpoint,
-            str(self._device), gpu_name, gpu_uuid or "?",
+            "BridgePublisherIPC initialized: %dx%d, ring_size=%d, endpoint=%s, device=%s (%s, uuid=%s)",
+            self._width,
+            self._height,
+            self._ring_size,
+            endpoint,
+            str(self._device),
+            gpu_name,
+            gpu_uuid or "?",
         )
 
     # ---------------------------------------------------------------------------
@@ -257,13 +290,17 @@ class BridgePublisherIPC:
             for p in getattr(self, "_rgb_slot_ptrs", []):
                 if p:
                     self._cudart.cudaFree(int(p))
+            for p in getattr(self, "_rgb_right_slot_ptrs", []):
+                if p:
+                    self._cudart.cudaFree(int(p))
             for p in getattr(self, "_depth_slot_ptrs", []):
                 if p:
                     self._cudart.cudaFree(int(p))
             self._rgb_slot_ptrs = []
+            self._rgb_right_slot_ptrs = []
             self._depth_slot_ptrs = []
 
-    def __enter__(self) -> "BridgePublisherIPC":
+    def __enter__(self) -> BridgePublisherIPC:
         return self
 
     def __exit__(self, *_args) -> None:
@@ -277,26 +314,43 @@ class BridgePublisherIPC:
     # ---------------------------------------------------------------------------
 
     def _send_handshake(self) -> None:
-        header = struct.pack(
-            _V2_HANDSHAKE_FORMAT,
-            _MAGIC_V2,
-            _SCHEMA_VERSION_V2,
-            _MESSAGE_TYPE_HANDSHAKE,
-            _V2_HANDSHAKE_SIZE,
-            self._ring_size,
-            self._width,
-            self._height,
-            _DEPTH_DTYPE_UINT16_MM,
-        )
+        if self._stereo:
+            header = struct.pack(
+                _V4_HANDSHAKE_FORMAT,
+                _MAGIC_V4,
+                _SCHEMA_VERSION_V4,
+                _MESSAGE_TYPE_HANDSHAKE,
+                _V4_HANDSHAKE_SIZE,
+                self._ring_size,
+                self._width,
+                self._height,
+                _DEPTH_DTYPE_UINT16_MM,
+                self._baseline_m,
+            )
+        else:
+            header = struct.pack(
+                _V2_HANDSHAKE_FORMAT,
+                _MAGIC_V2,
+                _SCHEMA_VERSION_V2,
+                _MESSAGE_TYPE_HANDSHAKE,
+                _V2_HANDSHAKE_SIZE,
+                self._ring_size,
+                self._width,
+                self._height,
+                _DEPTH_DTYPE_UINT16_MM,
+            )
         body = bytearray()
         for i in range(self._ring_size):
             body += self._rgb_mem_handles[i]
+            if self._stereo:
+                body += self._rgb_right_mem_handles[i]
             body += self._depth_mem_handles[i]
         # One-shot: send blocking so the receiver definitely gets it before frames.
         self._socket.send(header + bytes(body))
         logger.info(
             "BridgePublisherIPC handshake sent (%d header + %d handles bytes)",
-            len(header), len(body),
+            len(header),
+            len(body),
         )
 
     # ---------------------------------------------------------------------------
@@ -309,14 +363,21 @@ class BridgePublisherIPC:
         depth_u16_gpu: torch.Tensor,
         width: int,
         height: int,
-        fx: float, fy: float, cx: float, cy: float,
+        fx: float,
+        fy: float,
+        cx: float,
+        cy: float,
         t_cam_world_column_major: np.ndarray,
         timestamp_ns: int | None = None,
+        rgb_right_gpu: torch.Tensor | None = None,
     ) -> None:
         """Copy ``rgb_gpu`` / ``depth_u16_gpu`` into the next slot and send the header.
 
         ``rgb_gpu``: CUDA uint8 tensor shape ``(H, W, 3)``.
         ``depth_u16_gpu``: CUDA uint16 tensor shape ``(H, W)``.
+        ``rgb_right_gpu``: optional right-eye RGB (stereo publishers only). If
+        the publisher is stereo and the right frame is momentarily missing,
+        the left frame is duplicated into the right slot (warned once).
         """
         if self._socket is None:
             raise RuntimeError("BridgePublisherIPC socket is closed")
@@ -325,6 +386,21 @@ class BridgePublisherIPC:
                 f"BridgePublisherIPC was initialized for {self._width}x{self._height};"
                 f" got a frame of {width}x{height}. Recreate the publisher."
             )
+        if rgb_right_gpu is not None and not self._stereo:
+            if not getattr(self, "_mono_right_warned", False):
+                self._mono_right_warned = True
+                logger.warning(
+                    "BridgePublisherIPC was created mono (right eye missing on the"
+                    " first frame); ignoring rgb_right_gpu on later frames."
+                )
+            rgb_right_gpu = None
+        if self._stereo and rgb_right_gpu is None:
+            if not getattr(self, "_stereo_left_dup_warned", False):
+                self._stereo_left_dup_warned = True
+                logger.warning(
+                    "Stereo BridgePublisherIPC got no right frame; duplicating the left eye into the right slot."
+                )
+            rgb_right_gpu = rgb_gpu
 
         if not self._handshake_sent:
             self._send_handshake()
@@ -357,6 +433,18 @@ class BridgePublisherIPC:
                 ),
                 "cudaMemcpyAsync(rgb -> slot)",
             )
+            if self._stereo:
+                _check(
+                    cudart,
+                    cudart.cudaMemcpyAsync(
+                        self._rgb_right_slot_ptrs[slot],
+                        int(rgb_right_gpu.data_ptr()),
+                        self._rgb_slot_bytes,
+                        cudart.cudaMemcpyKind.cudaMemcpyDeviceToDevice,
+                        stream_ptr,
+                    ),
+                    "cudaMemcpyAsync(rgb right -> slot)",
+                )
             _check(
                 cudart,
                 cudart.cudaMemcpyAsync(
@@ -382,14 +470,18 @@ class BridgePublisherIPC:
 
         header = struct.pack(
             _V2_FRAME_FORMAT,
-            _MAGIC_V2,
-            _SCHEMA_VERSION_V2,
+            _MAGIC_V4 if self._stereo else _MAGIC_V2,
+            _SCHEMA_VERSION_V4 if self._stereo else _SCHEMA_VERSION_V2,
             _MESSAGE_TYPE_FRAME,
             _V2_FRAME_SIZE,
             self._frame_id,
             ts_ns,
-            int(width), int(height),
-            float(fx), float(fy), float(cx), float(cy),
+            int(width),
+            int(height),
+            float(fx),
+            float(fy),
+            float(cx),
+            float(cy),
             _DEPTH_SCALE_M_PER_UNIT,
             *pose.tolist(),
             self._reset_sequence,

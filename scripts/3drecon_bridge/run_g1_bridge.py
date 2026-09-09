@@ -33,9 +33,7 @@ if _THIS_DIR not in sys.path:
 def _build_arg_parser() -> argparse.ArgumentParser:
     from isaaclab.app import AppLauncher  # imported here so --help works pre-launch
 
-    parser = argparse.ArgumentParser(
-        description="Stream G1 head-camera frames to the realtime-3d-reconstruction app."
-    )
+    parser = argparse.ArgumentParser(description="Stream G1 head-camera frames to the realtime-3d-reconstruction app.")
     parser.add_argument(
         "--num_envs",
         type=int,
@@ -75,9 +73,9 @@ def main() -> None:
 
     # Imports that depend on Kit being live must come after AppLauncher.
     import torch
-    from isaaclab.envs import ManagerBasedRLEnv
-
     from locomanipulation_g1_bridge_env_cfg import LocomanipulationG1BridgeEnvCfg
+
+    from isaaclab.envs import ManagerBasedRLEnv
 
     print(f"[bridge-runner] building env (num_envs={args.num_envs})", flush=True)
     env_cfg = LocomanipulationG1BridgeEnvCfg()
@@ -87,8 +85,7 @@ def main() -> None:
 
     env = ManagerBasedRLEnv(cfg=env_cfg)
     print(
-        f"[bridge-runner] env built; action_dim={env.action_manager.total_action_dim}"
-        f" device={env.device}",
+        f"[bridge-runner] env built; action_dim={env.action_manager.total_action_dim} device={env.device}",
         flush=True,
     )
 
@@ -121,9 +118,7 @@ def main() -> None:
                 "[bridge-runner] could not build hold-pose action; falling back to zeros",
                 flush=True,
             )
-            hold_action = torch.zeros(
-                (args.num_envs, env.action_manager.total_action_dim), device=env.device
-            )
+            hold_action = torch.zeros((args.num_envs, env.action_manager.total_action_dim), device=env.device)
 
         step = 0
         print("[bridge-runner] entering step loop", flush=True)
